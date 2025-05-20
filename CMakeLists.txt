@@ -13,12 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.18)
 project(merlin-hkvs LANGUAGES CXX CUDA)
 find_package(CUDAToolkit)
 
-set(CMAKE_CXX_STANDARD 14)
-set(CMAKE_CUDA_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/modules)
 
 option(CLANGFORMAT "Clangformat code files before compiling" OFF)
@@ -78,7 +80,11 @@ include_directories(
   ${PROJECT_SOURCE_DIR}/tests/googletest/googletest/include
 )
 
-ADD_SUBDIRECTORY(tests/googletest)
+add_subdirectory(tests/googletest)
+
+# Python bindings
+add_subdirectory(py_bindings)
+add_subdirectory(benchmark)
 
 link_directories(
 )
@@ -145,7 +151,7 @@ target_compile_features(assign_score_test PUBLIC cxx_std_14)
 set_target_properties(assign_score_test PROPERTIES  CUDA_ARCHITECTURES OFF)
 TARGET_LINK_LIBRARIES(assign_score_test gtest_main)
 
-add_executable(accum_or_assign_test tests/accum_or_assign_test.cc)
+add_executable(accum_or_assign_test tests/accum_or_assign_test.cc.cu)
 target_compile_features(accum_or_assign_test PUBLIC cxx_std_14)
 set_target_properties(accum_or_assign_test PROPERTIES  CUDA_ARCHITECTURES OFF)
 TARGET_LINK_LIBRARIES(accum_or_assign_test gtest_main)
@@ -173,3 +179,5 @@ add_executable(find_or_insert_ptr_lock_test tests/find_or_insert_ptr_lock_test.c
 target_compile_features(find_or_insert_ptr_lock_test PUBLIC cxx_std_14)
 set_target_properties(find_or_insert_ptr_lock_test PROPERTIES  CUDA_ARCHITECTURES OFF)
 TARGET_LINK_LIBRARIES(find_or_insert_ptr_lock_test gtest_main)
+
+

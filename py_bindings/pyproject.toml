@@ -1,0 +1,21 @@
+[build-system]
+requires = [
+    "scikit-build-core",
+    "setuptools>=42",
+    "wheel",
+    "cmake>=3.18",
+    "pybind11",
+]
+build-backend = "scikit_build_core.build"
+
+
+[project]
+name = "merlin_hashtable_python"
+version = "0.1.0"
+description = "Python bindings for Merlin HashTable"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Haiqiang Zhang", email = "a1552094108@gmail.com"},
+]

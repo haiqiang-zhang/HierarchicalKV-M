@@ -1,0 +1,13 @@
+name: h_kv
+channels:
+  - conda-forge
+  - nvidia
+  - defaults
+dependencies:
+  - python=3.11
+  - nlohmann_json=3.12.0
+  - cmake>=3.30.4
+  - gcc_linux-64=11.*
+  - cuda=12.6.3
+  - pybind11==2.13.6
+  - cupy
