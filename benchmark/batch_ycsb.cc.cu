@@ -28,8 +28,20 @@ using json = nlohmann::json;
 // Custom parameters for batch benchmarking
 struct BatchBenchmarkParams {
   std::vector<uint32_t> batch_sizes = {1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152};
-  std::vector<double> read_props = {1.0};
-  std::string output_file = "batch_benchmark_results.json";
+  std::vector<double> read_props    = {1.0};
+  std::string output_file           = "batch_benchmark_results.json";
+  uint16_t gpu_id                   = 0;
+  uint64_t record_count             = 6ull * 1024 * 1024;    // preload rows
+  uint64_t num_batch_ops            = 200;                    // total batched ops
+  double   read_prop                = 1;                     // read fraction
+  std::string distribution          = "zipf";
+  double   theta                    = 0;                     // zipf skew
+  uint32_t multiget_batch_size      = 64 * 1024;             // keys per kernel launch
+  uint32_t multiset_batch_size      = 64 * 1024;             // keys per kernel launch
+  uint32_t dim                      = 5;                     // vector dimension
+  uint64_t init_capacity            = 12ull * 1024 * 1024;   // slots
+  uint32_t hbm_gb                   = 18;                    // HBM for vectors
+  uint64_t seed                     = 42;
 };
 
 static void usage(const char* prog, const bool is_error = false) {
@@ -38,7 +50,7 @@ static void usage(const char* prog, const bool is_error = false) {
                         + "  -h, --help             print this help message\n"
                         + "  --gpu_id=N             GPU ID (default 0)\n"
                         + "  --recordcount=N        preload N records (default 10M)\n"
-                        + "  --operationcount=N     execute N ops (default 50M)\n"
+                        + "  --num_batch_ops=N      execute N ops (default 200)\n"
                         + "  --distribution=d       zipf | uniform (default zipf)\n"
                         + "  --theta=f              zipf theta (default 0.99)\n"
                         + "  --dim=N                vector dimension (default 64)\n"
@@ -80,7 +92,7 @@ Flags parse_batch_flags(int argc, char** argv, BatchBenchmarkParams& batch_param
       {"help",            no_argument,       nullptr, 'h'  },
       {"gpu_id",          required_argument, nullptr, 'i'  },
       {"recordcount",     required_argument, nullptr, 'r'  },
-      {"operationcount",  required_argument, nullptr, 'o'  },
+      {"num_batch_ops",   required_argument, nullptr, 'o'  },
       {"distribution",    required_argument, nullptr, 'd'  },
       {"theta",           required_argument, nullptr, 't'  },
       {"dim",             required_argument, nullptr, 'm'  },
@@ -98,21 +110,34 @@ Flags parse_batch_flags(int argc, char** argv, BatchBenchmarkParams& batch_param
   while ((opt = getopt_long(argc, argv, "h", long_opts, &long_idx)) != -1) {
     switch (opt) {
       case 'h': usage(argv[0], false); exit(EXIT_SUCCESS);
-      case 'i': f.gpu_id          = std::strtoul (optarg, nullptr, 10); break;
-      case 'r': f.record_count    = std::strtoull(optarg, nullptr, 10);   break;
-      case 'o': f.operation_count = std::strtoull(optarg, nullptr, 10);   break;
-      case 'd': f.distribution    = optarg;                               break;
-      case 't': f.theta           = std::strtod (optarg, nullptr);        break;
-      case 'm': f.dim             = std::strtoul (optarg, nullptr, 10);   break;
-      case 'c': f.init_capacity   = std::strtoull(optarg, nullptr, 10);   break;
-      case 'g': f.hbm_gb          = std::strtoul (optarg, nullptr, 10);   break;
-      case 's': f.seed            = std::strtoull(optarg, nullptr, 10);   break;
+      case 'i': batch_params.gpu_id          = std::strtoul (optarg, nullptr, 10); break;
+      case 'r': batch_params.record_count    = std::strtoull(optarg, nullptr, 10);   break;
+      case 'o': batch_params.num_batch_ops = std::strtoull(optarg, nullptr, 10);   break;
+      case 'd': batch_params.distribution    = optarg;                               break;
+      case 't': batch_params.theta           = std::strtod (optarg, nullptr);        break;
+      case 'm': batch_params.dim             = std::strtoul (optarg, nullptr, 10);   break;
+      case 'c': batch_params.init_capacity   = std::strtoull(optarg, nullptr, 10);   break;
+      case 'g': batch_params.hbm_gb          = std::strtoul (optarg, nullptr, 10);   break;
+      case 's': batch_params.seed            = std::strtoull(optarg, nullptr, 10);   break;
       case 'b': batch_params.batch_sizes = parse_comma_separated<uint32_t>(optarg); break;
       case 'p': batch_params.read_props = parse_comma_separated<double>(optarg);    break;
       case 'f': batch_params.output_file = optarg;                        break;
       default : usage(argv[0], true); exit(EXIT_FAILURE);
     }
   }
+
+
+  // convert batch_params to Flags
+  f.gpu_id = batch_params.gpu_id;
+  f.record_count = batch_params.record_count;
+  f.num_batch_ops = batch_params.num_batch_ops;
+  f.read_prop = batch_params.read_prop;
+  f.distribution = batch_params.distribution;
+  f.theta = batch_params.theta;
+  f.dim = batch_params.dim;
+  f.init_capacity = batch_params.init_capacity;
+  f.hbm_gb = batch_params.hbm_gb;
+  f.seed = batch_params.seed;
   
   return f;
 }
@@ -132,9 +157,9 @@ void run_batch_benchmark(const Flags& base_cfg, const BatchBenchmarkParams& batc
   for (const auto& batch_size : batch_params.batch_sizes) {
     for (const auto& read_prop : batch_params.read_props) {
       Flags cfg = base_cfg;
-      cfg.batch_size = batch_size;
+      cfg.multiget_batch_size = batch_size;
+      cfg.multiset_batch_size = batch_size;
       cfg.read_prop = read_prop;
-      cfg.operation_count = 100 * batch_size;
       
       std::cout << "Running benchmark with batch_size=" << batch_size 
                 << ", read_prop=" << read_prop << std::endl;
@@ -147,8 +172,10 @@ void run_batch_benchmark(const Flags& base_cfg, const BatchBenchmarkParams& batc
         {"distribution", cfg.distribution},
         {"num_records", cfg.record_count},
         {"batch_size", batch_size},
-        {"num_ops", cfg.operation_count},
+        {"num_batch_ops", cfg.num_batch_ops},
         {"multiget_prob", read_prop},
+        {"multiget_batch_size", cfg.multiget_batch_size},
+        {"multiset_batch_size", cfg.multiset_batch_size},
         {"total_time", result.time_seconds},
         {"throughput", result.ops_per_sec},
         {"gbkv_per_sec", result.gbkv_per_sec},
@@ -158,6 +185,7 @@ void run_batch_benchmark(const Flags& base_cfg, const BatchBenchmarkParams& batc
         {"field_count", cfg.dim},
         {"init_capacity", cfg.init_capacity},
         {"hbm_gb", cfg.hbm_gb},
+        {"load_factor", cfg.record_count / (double) cfg.init_capacity},
         {"seed", cfg.seed}
       };
       
@@ -183,13 +211,14 @@ int main(int argc, char** argv) {
   std::cout << "Batch YCSB Benchmark Configuration:" << std::endl;
   std::cout << "  GPU ID: " << base_cfg.gpu_id << std::endl;
   std::cout << "  Record count: " << base_cfg.record_count << std::endl;
-  std::cout << "  Operation count: " << base_cfg.operation_count << std::endl;
+  std::cout << "  Number of batch operations: " << base_cfg.num_batch_ops << std::endl;
   std::cout << "  Distribution: " << base_cfg.distribution << std::endl;
   if (base_cfg.distribution == "zipf") {
     std::cout << "  Zipf theta: " << base_cfg.theta << std::endl;
   }
   std::cout << "  Vector dimension: " << base_cfg.dim << std::endl;
   std::cout << "  Initial capacity: " << base_cfg.init_capacity << std::endl;
+  std::cout << "  Load factor: " << base_cfg.record_count / (double) base_cfg.init_capacity << std::endl;
   std::cout << "  HBM size (GB): " << base_cfg.hbm_gb << std::endl;
   std::cout << "  Seed: " << base_cfg.seed << std::endl;
   

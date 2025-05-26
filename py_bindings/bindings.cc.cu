@@ -1,7 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
-
+#include <cstring>
 
 #include "merlin_hashtable.cuh"
 #include "mlkv/string_type.cuh"
@@ -63,120 +63,195 @@ PYBIND11_MODULE(merlin_hashtable_python, m) {
         });
 
     /* ─────────────────────  StringType Bindings  ───────────────────── */
-    py::class_<mlkv::StringType<256>>(m, "String", py::module_local(), 
-        "Fixed-size string that can be used as a value in the hash table (256 chars)")
-        .def(py::init<>(), "Create an empty string")
-        .def(py::init<const char*>(), "Create a string from C-style string")
-        .def(py::init<const mlkv::StringType<256>&>(), "Copy constructor")
-        .def("__str__", [](const mlkv::StringType<256>& s) { return std::string(s.c_str()); })
-        .def("__repr__", [](const mlkv::StringType<256>& s) { 
-            return "<String \"" + std::string(s.c_str()) + "\">"; 
+    py::class_<mlkv::CuString>(m, "CuString", py::module_local(),
+        "Simple fixed-size string that can be used as a value in the hash table (10 chars)")
+        .def(py::init<>(), "Create an empty CuString")
+        .def(py::init<const mlkv::CuString&>(), "Copy constructor")
+        .def(py::init([](const char* str) {
+            mlkv::CuString s;
+            s = str;
+            return s;
+        }), py::arg("str"), "Create a CuString from C-style string")
+        .def("__str__", [](const mlkv::CuString& s) { 
+            return std::string(s.data); 
         })
-        .def("__len__", &mlkv::StringType<256>::length)
-        .def("__getitem__", [](const mlkv::StringType<256>& s, size_t i) {
-            if (i >= s.length()) throw py::index_error("String index out of range");
-            return s[i];
+        .def("__repr__", [](const mlkv::CuString& s) { 
+            return "<CuString \"" + std::string(s.data) + "\">"; 
         })
-        .def("__eq__", [](const mlkv::StringType<256>& s, const char* other) { return s == other; })
-        .def("__eq__", [](const mlkv::StringType<256>& s, const mlkv::StringType<256>& other) { return s == other; })
-        .def("__add__", [](const mlkv::StringType<256>& s, const char* other) { return s + other; })
-        .def("__add__", [](const mlkv::StringType<256>& s, const mlkv::StringType<256>& other) { return s + other; })
-        .def("__iadd__", [](mlkv::StringType<256>& s, const char* other) { return s += other; })
-        .def("__iadd__", [](mlkv::StringType<256>& s, const mlkv::StringType<256>& other) { return s += other; })
-        .def("find", [](const mlkv::StringType<256>& s, const char* substr, size_t pos) { return s.find(substr, pos); },
-            py::arg("substr"), py::arg("pos") = 0)
-        .def("find", [](const mlkv::StringType<256>& s, char c, size_t pos) { return s.find(c, pos); },
-            py::arg("char"), py::arg("pos") = 0)
-        .def("substr", &mlkv::StringType<256>::substr,
-            py::arg("pos") = 0, py::arg("len") = mlkv::StringType<256>::npos)
-        .def("c_str", &mlkv::StringType<256>::c_str)
-        .def("empty", &mlkv::StringType<256>::empty)
-        .def("clear", &mlkv::StringType<256>::clear)
-        .def("length", &mlkv::StringType<256>::length)
-        .def("max_size", &mlkv::StringType<256>::max_size)
-        .def("resize", &mlkv::StringType<256>::resize,
-            py::arg("count"), py::arg("ch") = '\0')
-        .def_property_readonly_static("sizeof", [](py::object) { return sizeof(mlkv::StringType<256>); },
-            "Get the size of this StringType object in bytes.");
+        .def("__len__", [](const mlkv::CuString& s) {
+            size_t len = 0;
+            while (len < mlkv::MAX_STRING_LENGTH && s.data[len]) len++;
+            return len;
+        })
+        .def("__getitem__", [](const mlkv::CuString& s, size_t i) {
+            if (i >= mlkv::MAX_STRING_LENGTH) throw py::index_error("CuString index out of range");
+            return s.data[i];
+        })
+        .def("__setitem__", [](mlkv::CuString& s, size_t i, char c) {
+            if (i >= mlkv::MAX_STRING_LENGTH) throw py::index_error("CuString index out of range");
+            s.data[i] = c;
+        })
+        .def("__eq__", [](const mlkv::CuString& s, const mlkv::CuString& other) { 
+            return strcmp(s.data, other.data) == 0; 
+        })
+        .def("__eq__", [](const mlkv::CuString& s, const char* other) { 
+            return strcmp(s.data, other ? other : "") == 0; 
+        })
+        .def("__iadd__", [](mlkv::CuString& s, const mlkv::CuString& other) { 
+            s += other; 
+            return s; 
+        })
+        .def("__iadd__", [](mlkv::CuString& s, const char* other) { 
+            if (other) {
+                size_t len = 0;
+                while (s.data[len] && len < mlkv::MAX_STRING_LENGTH - 1) len++;
+                
+                size_t i = 0;
+                while (other[i] && len + i < mlkv::MAX_STRING_LENGTH - 1) {
+                    s.data[len + i] = other[i];
+                    i++;
+                }
+                s.data[len + i] = '\0';
+            }
+            return s; 
+        })
+        .def("assign", [](mlkv::CuString& s, const char* str) {
+            s = str;
+            return s;
+        }, py::arg("str"), "Assign a C-style string to this CuString")
+        .def("c_str", [](const mlkv::CuString& s) { 
+            return s.data; 
+        }, "Get the C-style string data")
+        .def("empty", [](const mlkv::CuString& s) { 
+            return s.data[0] == '\0'; 
+        }, "Check if the string is empty")
+        .def("clear", [](mlkv::CuString& s) { 
+            s.data[0] = '\0'; 
+        }, "Clear the string")
+        .def("max_size", [](const mlkv::CuString& s) { 
+            return mlkv::MAX_STRING_LENGTH; 
+        }, "Get the maximum size of the string buffer")
+        .def_property_readonly_static("sizeof", [](py::object) { 
+            return sizeof(mlkv::CuString); 
+        }, "Get the size of this CuString object in bytes")
+        .def_property_readonly_static("max_length", [](py::object) { 
+            return mlkv::MAX_STRING_LENGTH; 
+        }, "Get the maximum string length");
+
+    // py::class_<mlkv::StringType<256>>(m, "String", py::module_local(), 
+    //     "Fixed-size string that can be used as a value in the hash table (256 chars)")
+    //     .def(py::init<>(), "Create an empty string")
+    //     .def(py::init<const char*>(), "Create a string from C-style string")
+    //     .def(py::init<const mlkv::StringType<256>&>(), "Copy constructor")
+    //     .def("__str__", [](const mlkv::StringType<256>& s) { return std::string(s.c_str()); })
+    //     .def("__repr__", [](const mlkv::StringType<256>& s) { 
+    //         return "<String \"" + std::string(s.c_str()) + "\">"; 
+    //     })
+    //     .def("__len__", &mlkv::StringType<256>::length)
+    //     .def("__getitem__", [](const mlkv::StringType<256>& s, size_t i) {
+    //         if (i >= s.length()) throw py::index_error("String index out of range");
+    //         return s[i];
+    //     })
+    //     .def("__eq__", [](const mlkv::StringType<256>& s, const char* other) { return s == other; })
+    //     .def("__eq__", [](const mlkv::StringType<256>& s, const mlkv::StringType<256>& other) { return s == other; })
+    //     .def("__add__", [](const mlkv::StringType<256>& s, const char* other) { return s + other; })
+    //     .def("__add__", [](const mlkv::StringType<256>& s, const mlkv::StringType<256>& other) { return s + other; })
+    //     .def("__iadd__", [](mlkv::StringType<256>& s, const char* other) { return s += other; })
+    //     .def("__iadd__", [](mlkv::StringType<256>& s, const mlkv::StringType<256>& other) { return s += other; })
+    //     .def("find", [](const mlkv::StringType<256>& s, const char* substr, size_t pos) { return s.find(substr, pos); },
+    //         py::arg("substr"), py::arg("pos") = 0)
+    //     .def("find", [](const mlkv::StringType<256>& s, char c, size_t pos) { return s.find(c, pos); },
+    //         py::arg("char"), py::arg("pos") = 0)
+    //     .def("substr", &mlkv::StringType<256>::substr,
+    //         py::arg("pos") = 0, py::arg("len") = mlkv::StringType<256>::npos)
+    //     .def("c_str", &mlkv::StringType<256>::c_str)
+    //     .def("empty", &mlkv::StringType<256>::empty)
+    //     .def("clear", &mlkv::StringType<256>::clear)
+    //     .def("length", &mlkv::StringType<256>::length)
+    //     .def("max_size", &mlkv::StringType<256>::max_size)
+    //     .def("resize", &mlkv::StringType<256>::resize,
+    //         py::arg("count"), py::arg("ch") = '\0')
+    //     .def_property_readonly_static("sizeof", [](py::object) { return sizeof(mlkv::StringType<256>); },
+    //         "Get the size of this StringType object in bytes.");
 
 
-    py::class_<mlkv::StringType<64>>(m, "SmallString", py::module_local(), 
-        "Fixed-size string that can be used as a value in the hash table (64 chars)")
-        .def(py::init<>(), "Create an empty string")
-        .def(py::init<const char*>(), "Create a string from C-style string")
-        .def(py::init<const mlkv::StringType<64>&>(), "Copy constructor")
-        .def("__str__", [](const mlkv::StringType<64>& s) { return std::string(s.c_str()); })
-        .def("__repr__", [](const mlkv::StringType<64>& s) { 
-            return "<SmallString \"" + std::string(s.c_str()) + "\">"; 
-        })
-        .def("__len__", &mlkv::StringType<64>::length)
-        .def("__getitem__", [](const mlkv::StringType<64>& s, size_t i) {
-            if (i >= s.length()) throw py::index_error("String index out of range");
-            return s[i];
-        })
-        .def("__eq__", [](const mlkv::StringType<64>& s, const char* other) { return s == other; })
-        .def("__eq__", [](const mlkv::StringType<64>& s, const mlkv::StringType<64>& other) { return s == other; })
-        .def("__add__", [](const mlkv::StringType<64>& s, const char* other) { return s + other; })
-        .def("__add__", [](const mlkv::StringType<64>& s, const mlkv::StringType<64>& other) { return s + other; })
-        .def("__iadd__", [](mlkv::StringType<64>& s, const char* other) { return s += other; })
-        .def("__iadd__", [](mlkv::StringType<64>& s, const mlkv::StringType<64>& other) { return s += other; })
-        .def("find", [](const mlkv::StringType<64>& s, const char* substr, size_t pos) { return s.find(substr, pos); },
-            py::arg("substr"), py::arg("pos") = 0)
-        .def("find", [](const mlkv::StringType<64>& s, char c, size_t pos) { return s.find(c, pos); },
-            py::arg("char"), py::arg("pos") = 0)
-        .def("substr", &mlkv::StringType<64>::substr,
-            py::arg("pos") = 0, py::arg("len") = mlkv::StringType<64>::npos)
-        .def("c_str", &mlkv::StringType<64>::c_str)
-        .def("empty", &mlkv::StringType<64>::empty)
-        .def("clear", &mlkv::StringType<64>::clear)
-        .def("length", &mlkv::StringType<64>::length)
-        .def("max_size", &mlkv::StringType<64>::max_size)
-        .def("resize", &mlkv::StringType<64>::resize,
-            py::arg("count"), py::arg("ch") = '\0')
-        .def_property_readonly_static("sizeof", [](py::object) { return sizeof(mlkv::StringType<64>); },
-            "Get the size of this StringType object in bytes.");
+    // py::class_<mlkv::StringType<64>>(m, "SmallString", py::module_local(), 
+    //     "Fixed-size string that can be used as a value in the hash table (64 chars)")
+    //     .def(py::init<>(), "Create an empty string")
+    //     .def(py::init<const char*>(), "Create a string from C-style string")
+    //     .def(py::init<const mlkv::StringType<64>&>(), "Copy constructor")
+    //     .def("__str__", [](const mlkv::StringType<64>& s) { return std::string(s.c_str()); })
+    //     .def("__repr__", [](const mlkv::StringType<64>& s) { 
+    //         return "<SmallString \"" + std::string(s.c_str()) + "\">"; 
+    //     })
+    //     .def("__len__", &mlkv::StringType<64>::length)
+    //     .def("__getitem__", [](const mlkv::StringType<64>& s, size_t i) {
+    //         if (i >= s.length()) throw py::index_error("String index out of range");
+    //         return s[i];
+    //     })
+    //     .def("__eq__", [](const mlkv::StringType<64>& s, const char* other) { return s == other; })
+    //     .def("__eq__", [](const mlkv::StringType<64>& s, const mlkv::StringType<64>& other) { return s == other; })
+    //     .def("__add__", [](const mlkv::StringType<64>& s, const char* other) { return s + other; })
+    //     .def("__add__", [](const mlkv::StringType<64>& s, const mlkv::StringType<64>& other) { return s + other; })
+    //     .def("__iadd__", [](mlkv::StringType<64>& s, const char* other) { return s += other; })
+    //     .def("__iadd__", [](mlkv::StringType<64>& s, const mlkv::StringType<64>& other) { return s += other; })
+    //     .def("find", [](const mlkv::StringType<64>& s, const char* substr, size_t pos) { return s.find(substr, pos); },
+    //         py::arg("substr"), py::arg("pos") = 0)
+    //     .def("find", [](const mlkv::StringType<64>& s, char c, size_t pos) { return s.find(c, pos); },
+    //         py::arg("char"), py::arg("pos") = 0)
+    //     .def("substr", &mlkv::StringType<64>::substr,
+    //         py::arg("pos") = 0, py::arg("len") = mlkv::StringType<64>::npos)
+    //     .def("c_str", &mlkv::StringType<64>::c_str)
+    //     .def("empty", &mlkv::StringType<64>::empty)
+    //     .def("clear", &mlkv::StringType<64>::clear)
+    //     .def("length", &mlkv::StringType<64>::length)
+    //     .def("max_size", &mlkv::StringType<64>::max_size)
+    //     .def("resize", &mlkv::StringType<64>::resize,
+    //         py::arg("count"), py::arg("ch") = '\0')
+    //     .def_property_readonly_static("sizeof", [](py::object) { return sizeof(mlkv::StringType<64>); },
+    //         "Get the size of this StringType object in bytes.");
 
 
-    py::class_<mlkv::StringType<1024>>(m, "LargeString", py::module_local(), 
-        "Fixed-size string that can be used as a value in the hash table (1024 chars)")
-        .def(py::init<>(), "Create an empty string")
-        .def(py::init<const char*>(), "Create a string from C-style string")
-        .def(py::init<const mlkv::StringType<1024>&>(), "Copy constructor")
-        .def("__str__", [](const mlkv::StringType<1024>& s) { return std::string(s.c_str()); })
-        .def("__repr__", [](const mlkv::StringType<1024>& s) { 
-            return "<LargeString \"" + std::string(s.c_str()) + "\">"; 
-        })
-        .def("__len__", &mlkv::StringType<1024>::length)
-        .def("__getitem__", [](const mlkv::StringType<1024>& s, size_t i) {
-            if (i >= s.length()) throw py::index_error("String index out of range");
-            return s[i];
-        })
-        .def("__eq__", [](const mlkv::StringType<1024>& s, const char* other) { return s == other; })
-        .def("__eq__", [](const mlkv::StringType<1024>& s, const mlkv::StringType<1024>& other) { return s == other; })
-        .def("__add__", [](const mlkv::StringType<1024>& s, const char* other) { return s + other; })
-        .def("__add__", [](const mlkv::StringType<1024>& s, const mlkv::StringType<1024>& other) { return s + other; })
-        .def("__iadd__", [](mlkv::StringType<1024>& s, const char* other) { return s += other; })
-        .def("__iadd__", [](mlkv::StringType<1024>& s, const mlkv::StringType<1024>& other) { return s += other; })
-        .def("find", [](const mlkv::StringType<1024>& s, const char* substr, size_t pos) { return s.find(substr, pos); },
-            py::arg("substr"), py::arg("pos") = 0)
-        .def("find", [](const mlkv::StringType<1024>& s, char c, size_t pos) { return s.find(c, pos); },
-            py::arg("char"), py::arg("pos") = 0)
-        .def("substr", &mlkv::StringType<1024>::substr,
-            py::arg("pos") = 0, py::arg("len") = mlkv::StringType<1024>::npos)
-        .def("c_str", &mlkv::StringType<1024>::c_str)
-        .def("empty", &mlkv::StringType<1024>::empty)
-        .def("clear", &mlkv::StringType<1024>::clear)
-        .def("length", &mlkv::StringType<1024>::length)
-        .def("max_size", &mlkv::StringType<1024>::max_size)
-        .def("resize", &mlkv::StringType<1024>::resize,
-            py::arg("count"), py::arg("ch") = '\0')
-        .def_property_readonly_static("sizeof", [](py::object) { return sizeof(mlkv::StringType<1024>); },
-            "Get the size of this StringType object in bytes.");
+    // py::class_<mlkv::StringType<1024>>(m, "LargeString", py::module_local(), 
+    //     "Fixed-size string that can be used as a value in the hash table (1024 chars)")
+    //     .def(py::init<>(), "Create an empty string")
+    //     .def(py::init<const char*>(), "Create a string from C-style string")
+    //     .def(py::init<const mlkv::StringType<1024>&>(), "Copy constructor")
+    //     .def("__str__", [](const mlkv::StringType<1024>& s) { return std::string(s.c_str()); })
+    //     .def("__repr__", [](const mlkv::StringType<1024>& s) { 
+    //         return "<LargeString \"" + std::string(s.c_str()) + "\">"; 
+    //     })
+    //     .def("__len__", &mlkv::StringType<1024>::length)
+    //     .def("__getitem__", [](const mlkv::StringType<1024>& s, size_t i) {
+    //         if (i >= s.length()) throw py::index_error("String index out of range");
+    //         return s[i];
+    //     })
+    //     .def("__eq__", [](const mlkv::StringType<1024>& s, const char* other) { return s == other; })
+    //     .def("__eq__", [](const mlkv::StringType<1024>& s, const mlkv::StringType<1024>& other) { return s == other; })
+    //     .def("__add__", [](const mlkv::StringType<1024>& s, const char* other) { return s + other; })
+    //     .def("__add__", [](const mlkv::StringType<1024>& s, const mlkv::StringType<1024>& other) { return s + other; })
+    //     .def("__iadd__", [](mlkv::StringType<1024>& s, const char* other) { return s += other; })
+    //     .def("__iadd__", [](mlkv::StringType<1024>& s, const mlkv::StringType<1024>& other) { return s += other; })
+    //     .def("find", [](const mlkv::StringType<1024>& s, const char* substr, size_t pos) { return s.find(substr, pos); },
+    //         py::arg("substr"), py::arg("pos") = 0)
+    //     .def("find", [](const mlkv::StringType<1024>& s, char c, size_t pos) { return s.find(c, pos); },
+    //         py::arg("char"), py::arg("pos") = 0)
+    //     .def("substr", &mlkv::StringType<1024>::substr,
+    //         py::arg("pos") = 0, py::arg("len") = mlkv::StringType<1024>::npos)
+    //     .def("c_str", &mlkv::StringType<1024>::c_str)
+    //     .def("empty", &mlkv::StringType<1024>::empty)
+    //     .def("clear", &mlkv::StringType<1024>::clear)
+    //     .def("length", &mlkv::StringType<1024>::length)
+    //     .def("max_size", &mlkv::StringType<1024>::max_size)
+    //     .def("resize", &mlkv::StringType<1024>::resize,
+    //         py::arg("count"), py::arg("ch") = '\0')
+    //     .def_property_readonly_static("sizeof", [](py::object) { return sizeof(mlkv::StringType<1024>); },
+    //         "Get the size of this StringType object in bytes.");
 
     /* ─────────────────────  HashTable  ───────────────────── */
     // Define common types for HashTable
     using KeyType = uint64_t;       // K
-    using ValueType = char;        // V
+    using ValueType = mlkv::CuString;        // V
     using ScoreType = uint64_t;     // S
     using ArchTag = Sm80;           // CUDA architecture tag
     
