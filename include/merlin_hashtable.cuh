@@ -21,6 +21,8 @@
 #include <thrust/sort.h>
 #include <atomic>
 #include <cstdint>
+#include <cub/cub.cuh>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -442,6 +444,26 @@ class HashTableBase {
                               key_type** locked_key_ptrs = nullptr) = 0;
 
   /**
+   * @brief
+   * This function will lock the keys in the table and unexisted keys will be
+   * ignored.
+   *
+   * @param n The number of keys in the table to be locked.
+   * @param locked_key_ptrs The pointers of locked keys in the table with shape
+   * (n).
+   * @param keys The keys to search on GPU-accessible memory with shape (n).
+   * @param succeededs The status that indicates if the lock operation is
+   * succeed.
+   * @param stream The CUDA stream that is used to execute the operation.
+   *
+   */
+  virtual void lock_keys(const size_type n,
+                         key_type const* keys,        // (n)
+                         key_type** locked_key_ptrs,  // (n)
+                         bool* succeededs = nullptr,  // (n)
+                         cudaStream_t stream = 0) = 0;
+
+  /**
    * @brief Using pointers to address the keys in the hash table and set them
    * to target keys.
    * This function will unlock the keys in the table which are locked by
@@ -451,14 +473,15 @@ class HashTableBase {
    * @param locked_key_ptrs The pointers of locked keys in the table with shape
    * (n).
    * @param keys The keys to search on GPU-accessible memory with shape (n).
-   * @param flags The status that indicates if the unlock operation is succeed.
+   * @param succeededs The status that indicates if the unlock operation is
+   * succeed.
    * @param stream The CUDA stream that is used to execute the operation.
    *
    */
   virtual void unlock_keys(const size_type n,
                            key_type** locked_key_ptrs,  // (n)
                            const key_type* keys,        // (n)
-                           bool* flags = nullptr,       // (n)
+                           bool* succeededs = nullptr,  // (n)
                            cudaStream_t stream = 0) = 0;
 
   /**
@@ -1233,16 +1256,33 @@ class HashTable : public HashTableBase<K, V, S> {
           evicted_keys, evicted_values, evicted_scores, n, d_evicted_counter,
           global_epoch_);
       Selector::select_kernel(kernelParams, stream);
+    } else if (unique_key and options_.max_bucket_size % 16 == 0) {
+      using KernelLauncher =
+          InsertAndEvictKernelLauncher<key_type, value_type, score_type,
+                                       evict_strategy>;
+      typename KernelLauncher::Params kernelParams(
+          load_factor, table_->buckets, table_->buckets_size,
+          table_->buckets_num, static_cast<uint32_t>(options_.max_bucket_size),
+          static_cast<uint32_t>(options_.dim), keys, values, scores,
+          evicted_keys, evicted_values, evicted_scores, n, d_evicted_counter,
+          global_epoch_);
+      KernelLauncher::launch_kernel(kernelParams, stream);
     } else {
       // always use max tile to avoid data-deps as possible.
       const int TILE_SIZE = 32;
       size_t n_offsets = (n + TILE_SIZE - 1) / TILE_SIZE;
       const size_type dev_ws_size =
-          n_offsets * sizeof(int64_t) + n * sizeof(bool) + sizeof(size_type);
+          n * (sizeof(key_type) + sizeof(score_type)) +
+          n_offsets * sizeof(int64_t) + n * dim() * sizeof(value_type) +
+          n * sizeof(bool);
 
       auto dev_ws{dev_mem_pool_->get_workspace<1>(dev_ws_size, stream)};
-      auto d_offsets{dev_ws.get<int64_t*>(0)};
-      auto d_masks = reinterpret_cast<bool*>(d_offsets + n_offsets);
+      auto tmp_evict_keys{dev_ws.get<key_type*>(0)};
+      auto tmp_evict_scores = reinterpret_cast<score_type*>(tmp_evict_keys + n);
+      auto d_offsets = reinterpret_cast<int64_t*>(tmp_evict_scores + n);
+      auto tmp_evict_values =
+          reinterpret_cast<value_type*>(d_offsets + n_offsets);
+      auto d_masks = reinterpret_cast<bool*>(tmp_evict_values + n * dim());
 
       CUDA_CHECK(
           cudaMemsetAsync(d_offsets, 0, n_offsets * sizeof(int64_t), stream));
@@ -1250,22 +1290,39 @@ class HashTable : public HashTableBase<K, V, S> {
 
       size_type block_size = options_.block_size;
       size_type grid_size = SAFE_GET_GRID_SIZE(n, block_size);
-      CUDA_CHECK(memset64Async(evicted_keys, EMPTY_KEY_CPU, n, stream));
+      CUDA_CHECK(memset64Async(tmp_evict_keys, EMPTY_KEY_CPU, n, stream));
       using Selector =
           SelectUpsertAndEvictKernelWithIO<key_type, value_type, score_type,
-                                          evict_strategy>;
-
+                                           evict_strategy>;
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      std::cout << __FILE__ << " " << __LINE__ << "\n";
       Selector::execute_kernel(
           load_factor, options_.block_size, options_.max_bucket_size,
           table_->buckets_num, options_.dim, stream, n, d_table_,
-          table_->buckets, keys, values, scores, evicted_keys, evicted_values,
-          evicted_scores, global_epoch_);
-
+          table_->buckets, keys, values, scores, tmp_evict_keys,
+          tmp_evict_values, tmp_evict_scores, global_epoch_);
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      std::cout << __FILE__ << " " << __LINE__ << "\n";
       keys_not_empty<K>
-          <<<grid_size, block_size, 0, stream>>>(evicted_keys, d_masks, n);
-      gpu_boolean_mask<K, V, S, int64_t, TILE_SIZE>(
-          grid_size, block_size, d_masks, n, d_evicted_counter, d_offsets,
-          evicted_keys, evicted_values, evicted_scores, dim(), stream);
+          <<<grid_size, block_size, 0, stream>>>(tmp_evict_keys, d_masks, n);
+
+      gpu_cell_count<int64_t, TILE_SIZE><<<grid_size, block_size, 0, stream>>>(
+          d_masks, d_offsets, n, d_evicted_counter);
+
+      void* d_temp_storage = nullptr;
+      size_t temp_storage_bytes = 0;
+      cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes,
+                                    d_offsets, d_offsets, n_offsets, stream);
+      auto dev_ws1{dev_mem_pool_->get_workspace<1>(temp_storage_bytes, stream)};
+      d_temp_storage = dev_ws1.get<void*>(0);
+      cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes,
+                                    d_offsets, d_offsets, n_offsets, stream);
+
+      compact_key_value_score_kernel<K, V, S, int64_t, TILE_SIZE>
+          <<<grid_size, block_size, 0, stream>>>(
+              d_masks, n, d_offsets, tmp_evict_keys, tmp_evict_values,
+              tmp_evict_scores, evicted_keys, evicted_values, evicted_scores,
+              dim());
     }
     return;
 
@@ -1835,6 +1892,45 @@ class HashTable : public HashTableBase<K, V, S> {
   }
 
   /**
+   * @brief
+   * This function will lock the keys in the table and unexisted keys will be
+   * ignored.
+   *
+   * @param n The number of keys in the table to be locked.
+   * @param locked_key_ptrs The pointers of locked keys in the table with shape
+   * (n).
+   * @param keys The keys to search on GPU-accessible memory with shape (n).
+   * @param success The status that indicates if the lock operation is
+   * succeed.
+   * @param stream The CUDA stream that is used to execute the operation.
+   *
+   */
+  void lock_keys(const size_type n,
+                 key_type const* keys,        // (n)
+                 key_type** locked_key_ptrs,  // (n)
+                 bool* success = nullptr,     // (n)
+                 cudaStream_t stream = 0) {
+    if (n == 0) {
+      return;
+    }
+
+    insert_unique_lock lock(mutex_, stream);
+
+    constexpr uint32_t MinBucketCapacityFilter = sizeof(VecD_Load) / sizeof(D);
+    if (options_.max_bucket_size < MinBucketCapacityFilter) {
+      throw std::runtime_error(
+          "Not support lock_keys API because the bucket capacity is too "
+          "small.");
+    }
+    constexpr uint32_t BLOCK_SIZE = 128U;
+    lock_kernel_with_filter<key_type, value_type, score_type>
+        <<<(n + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+            table_->buckets, table_->buckets_num, options_.max_bucket_size,
+            options_.dim, keys, locked_key_ptrs, success, n);
+    CudaCheckError();
+  }
+
+  /**
    * @brief Using pointers to address the keys in the hash table and set them
    * to target keys.
    * This function will unlock the keys in the table which are locked by
@@ -1844,13 +1940,14 @@ class HashTable : public HashTableBase<K, V, S> {
    * @param locked_key_ptrs The pointers of locked keys in the table with shape
    * (n).
    * @param keys The keys to search on GPU-accessible memory with shape (n).
-   * @param flags The status that indicates if the unlock operation is succeed.
+   * @param success The status that indicates if the unlock operation is
+   * succeed.
    * @param stream The CUDA stream that is used to execute the operation.
    *
    */
   void unlock_keys(const size_type n, key_type** locked_key_ptrs,  // (n)
                    const key_type* keys,                           // (n)
-                   bool* flags = nullptr,                          // (n)
+                   bool* success = nullptr,                        // (n)
                    cudaStream_t stream = 0) {
     if (n == 0) {
       return;
@@ -1862,7 +1959,7 @@ class HashTable : public HashTableBase<K, V, S> {
     /// TODO: check the key belongs to the bucket.
     unlock_keys_kernel<key_type>
         <<<(n + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-            n, locked_key_ptrs, keys, flags);
+            n, locked_key_ptrs, keys, success);
   }
 
   /**
@@ -2183,13 +2280,26 @@ class HashTable : public HashTableBase<K, V, S> {
 
       if (filter_condition) {
         const size_t block_size = options_.io_block_size;
-        const size_t N = n * dim();
-        const size_t grid_size = SAFE_GET_GRID_SIZE(N, block_size);
+        uint64_t total_value_size = sizeof(value_type) * dim();
+        if (total_value_size % 16 == 0) {
+          using VecV = byte16;
+          uint64_t vec_dim = total_value_size / sizeof(VecV);
+          const size_t N = n * vec_dim;
+          const size_t grid_size = SAFE_GET_GRID_SIZE(N, block_size);
 
-        write_kernel_unlock_key<key_type, value_type, score_type>
-            <<<grid_size, block_size, 0, stream>>>(values, d_dst, d_src_offset,
-                                                   dim(), keys, keys_ptr, N);
+          write_kernel_unlock_key<key_type, VecV, score_type>
+              <<<grid_size, block_size, 0, stream>>>(
+                  reinterpret_cast<const VecV*>(values),
+                  reinterpret_cast<VecV**>(d_dst), d_src_offset, vec_dim, keys,
+                  keys_ptr, N);
+        } else {
+          const size_t N = n * dim();
+          const size_t grid_size = SAFE_GET_GRID_SIZE(N, block_size);
 
+          write_kernel_unlock_key<key_type, value_type, score_type>
+              <<<grid_size, block_size, 0, stream>>>(
+                  values, d_dst, d_src_offset, dim(), keys, keys_ptr, N);
+        }
       } else if (options_.io_by_cpu) {
         const size_type host_ws_size{dev_ws_size +
                                      n * sizeof(value_type) * dim()};

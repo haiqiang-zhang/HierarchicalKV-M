@@ -1164,7 +1164,7 @@ __global__ void traverse_kernel(const uint64_t search_length,
 template <typename K>
 __global__ void unlock_keys_kernel(uint64_t n, K** __restrict__ locked_key_ptrs,
                                    const K* __restrict__ keys,
-                                   bool* __restrict__ flags) {
+                                   bool* __restrict__ succeededs) {
   int kv_idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (kv_idx < n) {
     K* locked_key_ptr = locked_key_ptrs[kv_idx];
@@ -1181,9 +1181,159 @@ __global__ void unlock_keys_kernel(uint64_t n, K** __restrict__ locked_key_ptrs,
     } else {
       flag = false;
     }
-    if (flags != nullptr) {
-      flags[kv_idx] = flag;
+    if (succeededs != nullptr) {
+      succeededs[kv_idx] = flag;
     }
+  }
+}
+
+template <typename K, typename V, typename S, typename Tidx, int TILE_SIZE = 8>
+__global__ void compact_key_value_score_kernel(
+    const bool* masks, size_t n, const Tidx* offsets,
+    K* __restrict const src_keys, V* __restrict const src_values,
+    S* __restrict const src_scores, K* __restrict dst_keys,
+    V* __restrict dst_values, S* __restrict dst_scores, const size_t dim) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  auto g = cg::tiled_partition<TILE_SIZE>(cg::this_thread_block());
+  int rank = g.thread_rank();
+
+  bool is_existed = false;
+  if (tid < n) {
+    if (masks[tid]) {
+      is_existed = true;
+    }
+  }
+  unsigned int vote = g.ballot(is_existed);
+  unsigned int r_vote = __brev(vote) >> (32 - TILE_SIZE);
+  K empty_key = (K)EMPTY_KEY;
+  Tidx bias;
+  if (is_existed) {
+    r_vote = r_vote >> (TILE_SIZE - rank - 1);
+    int prefix_n = __popc(r_vote) - 1;
+    bias = offsets[tid / TILE_SIZE] + static_cast<Tidx>(prefix_n);
+    dst_keys[bias] = src_keys[tid];
+    if (src_scores and dst_scores) dst_scores[bias] = src_scores[tid];
+  }
+
+  int group_offset = (tid / TILE_SIZE) * TILE_SIZE;
+  for (int i = 0; i < TILE_SIZE; i++) {
+    if (group_offset + i >= n) return;
+    auto cur_existed = g.shfl(is_existed, i);
+    if (cur_existed) {
+      auto cur_bias = g.shfl(bias, i);
+      for (size_t j = rank; j < dim; j += TILE_SIZE) {
+        dst_values[dim * cur_bias + j] =
+            src_values[dim * (group_offset + i) + j];
+      }
+    }
+  }
+}
+
+template <typename K, typename V, typename S>
+__global__ void lock_kernel_with_filter(
+    Bucket<K, V, S>* __restrict__ buckets, uint64_t const buckets_num,
+    uint32_t bucket_capacity, uint32_t const dim, K const* __restrict__ keys,
+    K** __restrict locked_keys_ptr, bool* __restrict succeed, uint64_t n) {
+  using BUCKET = Bucket<K, V, S>;
+  // Load `STRIDE` digests every time.
+  constexpr uint32_t STRIDE = sizeof(VecD_Load) / sizeof(D);
+
+  uint32_t tx = threadIdx.x;
+  uint32_t kv_idx = blockIdx.x * blockDim.x + tx;
+  K key{static_cast<K>(EMPTY_KEY)};
+  OccupyResult occupy_result{OccupyResult::INITIAL};
+  VecD_Comp target_digests{0};
+  K* bucket_keys_ptr{nullptr};
+  uint32_t key_pos = {0};
+  if (kv_idx < n) {
+    key = keys[kv_idx];
+    if (!IS_RESERVED_KEY<K>(key)) {
+      const K hashed_key = Murmur3HashDevice(key);
+      target_digests = digests_from_hashed<K>(hashed_key);
+      uint64_t global_idx =
+          static_cast<uint64_t>(hashed_key % (buckets_num * bucket_capacity));
+      key_pos = get_start_position(global_idx, bucket_capacity);
+      uint64_t bkt_idx = global_idx / bucket_capacity;
+      BUCKET* bucket = buckets + bkt_idx;
+      bucket_keys_ptr = reinterpret_cast<K*>(bucket->keys(0));
+    } else {
+      occupy_result = OccupyResult::ILLEGAL;
+      goto WRITE_BACK;
+    }
+  } else {
+    return;
+  }
+
+  // One more loop to handle empty keys.
+  for (int offset = 0; offset < bucket_capacity + STRIDE; offset += STRIDE) {
+    uint32_t pos_cur = align_to<STRIDE>(key_pos);
+    pos_cur = (pos_cur + offset) & (bucket_capacity - 1);
+
+    D* digests_ptr = BUCKET::digests(bucket_keys_ptr, bucket_capacity, pos_cur);
+    VecD_Load digests_vec = *(reinterpret_cast<VecD_Load*>(digests_ptr));
+    VecD_Comp digests_arr[4] = {digests_vec.x, digests_vec.y, digests_vec.z,
+                                digests_vec.w};
+
+    for (int i = 0; i < 4; i++) {
+      VecD_Comp probe_digests = digests_arr[i];
+      uint32_t possible_pos = 0;
+      // Perform a vectorized comparison by byte,
+      // and if they are equal, set the corresponding byte in the result to
+      // 0xff.
+      int cmp_result = __vcmpeq4(probe_digests, target_digests);
+      cmp_result &= 0x01010101;
+      do {
+        if (cmp_result == 0) break;
+        // CUDA uses little endian,
+        // and the lowest byte in register stores in the lowest address.
+        uint32_t index = (__ffs(cmp_result) - 1) >> 3;
+        cmp_result &= (cmp_result - 1);
+        possible_pos = pos_cur + i * 4 + index;
+        auto current_key = bucket_keys_ptr[possible_pos];
+        if (current_key == key) {
+          key_pos = possible_pos;
+          occupy_result = OccupyResult::DUPLICATE;
+          goto WRITE_BACK;
+        }
+      } while (true);
+      VecD_Comp empty_digests_ = empty_digests<K>();
+      cmp_result = __vcmpeq4(probe_digests, empty_digests_);
+      cmp_result &= 0x01010101;
+      do {
+        if (cmp_result == 0) break;
+        uint32_t index = (__ffs(cmp_result) - 1) >> 3;
+        cmp_result &= (cmp_result - 1);
+        possible_pos = pos_cur + i * 4 + index;
+        if (offset == 0 && possible_pos < key_pos) continue;
+        auto current_key = bucket_keys_ptr[possible_pos];
+        if (current_key == static_cast<K>(EMPTY_KEY)) {
+          occupy_result = OccupyResult::OCCUPIED_EMPTY;
+          goto WRITE_BACK;
+        }
+      } while (true);
+    }
+  }
+
+WRITE_BACK:
+  bool found_ = occupy_result == OccupyResult::DUPLICATE;
+  if (found_) {
+    auto current_key = BUCKET::keys(bucket_keys_ptr, key_pos);
+    K expected_key = key;
+    // Modifications to the bucket will not before this instruction.
+    bool result = current_key->compare_exchange_strong(
+        expected_key, static_cast<K>(LOCKED_KEY),
+        cuda::std::memory_order_relaxed, cuda::std::memory_order_relaxed);
+    if (not result) {
+      found_ = false;
+    }
+  }
+  if (found_) {
+    locked_keys_ptr[kv_idx] = bucket_keys_ptr + key_pos;
+  } else {
+    locked_keys_ptr[kv_idx] = nullptr;
+  }
+  if (succeed) {
+    succeed[kv_idx] = found_;
   }
 }
 
