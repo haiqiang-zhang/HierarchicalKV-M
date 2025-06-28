@@ -1208,9 +1208,10 @@ class HashTable : public HashTableBase<K, V, S> {
     insert_unique_lock lock(mutex_, stream);
 
     // TODO: Currently only need eviction when using HashTable as HBM cache.
-    if (!is_fast_mode()) {
-      throw std::runtime_error("Only allow insert_and_evict in pure HBM mode.");
-    }
+    // if (!is_fast_mode()) {
+    //   throw std::runtime_error("Only allow insert_and_evict in pure HBM mode.");
+    // }
+
 
     static thread_local int step_counter = 0;
     static thread_local float load_factor = 0.0;
@@ -1223,8 +1224,8 @@ class HashTable : public HashTableBase<K, V, S> {
         KernelSelector_UpsertAndEvict<key_type, value_type, score_type,
                                       evict_strategy, ArchTag>;
     if (Selector::callable(unique_key,
-                           static_cast<uint32_t>(options_.max_bucket_size),
-                           static_cast<uint32_t>(options_.dim))) {
+                          static_cast<uint32_t>(options_.max_bucket_size),
+                          static_cast<uint32_t>(options_.dim))) {
       typename Selector::Params kernelParams(
           load_factor, table_->buckets, table_->buckets_size,
           table_->buckets_num, static_cast<uint32_t>(options_.max_bucket_size),
@@ -1252,7 +1253,7 @@ class HashTable : public HashTableBase<K, V, S> {
       CUDA_CHECK(memset64Async(evicted_keys, EMPTY_KEY_CPU, n, stream));
       using Selector =
           SelectUpsertAndEvictKernelWithIO<key_type, value_type, score_type,
-                                           evict_strategy>;
+                                          evict_strategy>;
 
       Selector::execute_kernel(
           load_factor, options_.block_size, options_.max_bucket_size,
@@ -1267,6 +1268,108 @@ class HashTable : public HashTableBase<K, V, S> {
           evicted_keys, evicted_values, evicted_scores, dim(), stream);
     }
     return;
+
+    // if (is_fast_mode()) {
+    //   static thread_local int step_counter = 0;
+    //   static thread_local float load_factor = 0.0;
+
+    //   if (((step_counter++) % kernel_select_interval_) == 0) {
+    //     load_factor = fast_load_factor(0, stream, false);
+    //   }
+
+    //   using Selector =
+    //       KernelSelector_UpsertAndEvict<key_type, value_type, score_type,
+    //                                     evict_strategy, ArchTag>;
+    //   if (Selector::callable(unique_key,
+    //                         static_cast<uint32_t>(options_.max_bucket_size),
+    //                         static_cast<uint32_t>(options_.dim))) {
+    //     typename Selector::Params kernelParams(
+    //         load_factor, table_->buckets, table_->buckets_size,
+    //         table_->buckets_num, static_cast<uint32_t>(options_.max_bucket_size),
+    //         static_cast<uint32_t>(options_.dim), keys, values, scores,
+    //         evicted_keys, evicted_values, evicted_scores, n, d_evicted_counter,
+    //         global_epoch_);
+    //     Selector::select_kernel(kernelParams, stream);
+    //   } else {
+    //     // always use max tile to avoid data-deps as possible.
+    //     const int TILE_SIZE = 32;
+    //     size_t n_offsets = (n + TILE_SIZE - 1) / TILE_SIZE;
+    //     const size_type dev_ws_size =
+    //         n_offsets * sizeof(int64_t) + n * sizeof(bool) + sizeof(size_type);
+
+    //     auto dev_ws{dev_mem_pool_->get_workspace<1>(dev_ws_size, stream)};
+    //     auto d_offsets{dev_ws.get<int64_t*>(0)};
+    //     auto d_masks = reinterpret_cast<bool*>(d_offsets + n_offsets);
+
+    //     CUDA_CHECK(
+    //         cudaMemsetAsync(d_offsets, 0, n_offsets * sizeof(int64_t), stream));
+    //     CUDA_CHECK(cudaMemsetAsync(d_masks, 0, n * sizeof(bool), stream));
+
+    //     size_type block_size = options_.block_size;
+    //     size_type grid_size = SAFE_GET_GRID_SIZE(n, block_size);
+    //     CUDA_CHECK(memset64Async(evicted_keys, EMPTY_KEY_CPU, n, stream));
+    //     using Selector =
+    //         SelectUpsertAndEvictKernelWithIO<key_type, value_type, score_type,
+    //                                         evict_strategy>;
+
+    //     Selector::execute_kernel(
+    //         load_factor, options_.block_size, options_.max_bucket_size,
+    //         table_->buckets_num, options_.dim, stream, n, d_table_,
+    //         table_->buckets, keys, values, scores, evicted_keys, evicted_values,
+    //         evicted_scores, global_epoch_);
+
+    //     keys_not_empty<K>
+    //         <<<grid_size, block_size, 0, stream>>>(evicted_keys, d_masks, n);
+    //     gpu_boolean_mask<K, V, S, int64_t, TILE_SIZE>(
+    //         grid_size, block_size, d_masks, n, d_evicted_counter, d_offsets,
+    //         evicted_keys, evicted_values, evicted_scores, dim(), stream);
+    //   }
+    //   return;
+    // } else {
+    //   static thread_local int step_counter = 0;
+    //   static thread_local float load_factor = 0.0;
+
+    //   if (((step_counter++) % kernel_select_interval_) == 0) {
+    //     load_factor = fast_load_factor(0, stream, false);
+    //   }
+
+    //   // always use max tile to avoid data-deps as possible.
+    //   const int TILE_SIZE = 32;
+    //   size_t n_offsets = (n + TILE_SIZE - 1) / TILE_SIZE;
+    //   const size_type dev_ws_size =
+    //       n_offsets * sizeof(int64_t) + n * sizeof(bool) + sizeof(size_type);
+
+    //   auto dev_ws{dev_mem_pool_->get_workspace<1>(dev_ws_size, stream)};
+    //   auto d_offsets{dev_ws.get<int64_t*>(0)};
+    //   auto d_masks = reinterpret_cast<bool*>(d_offsets + n_offsets);
+
+    //   CUDA_CHECK(
+    //       cudaMemsetAsync(d_offsets, 0, n_offsets * sizeof(int64_t), stream));
+    //   CUDA_CHECK(cudaMemsetAsync(d_masks, 0, n * sizeof(bool), stream));
+
+    //   size_type block_size = options_.block_size;
+    //   size_type grid_size = SAFE_GET_GRID_SIZE(n, block_size);
+    //   CUDA_CHECK(memset64Async(evicted_keys, EMPTY_KEY_CPU, n, stream));
+    //   using Selector =
+    //       SelectUpsertAndEvictKernelHybrid<key_type, value_type, score_type,
+    //                                       evict_strategy>;
+
+    //   Selector::execute_kernel(
+    //       load_factor, options_.block_size, options_.max_bucket_size,
+    //       table_->buckets_num, options_.dim, stream, n, d_table_,
+    //       table_->buckets, keys, values, scores, evicted_keys, evicted_values,
+    //       evicted_scores, global_epoch_);
+
+    //   keys_not_empty<K>
+    //       <<<grid_size, block_size, 0, stream>>>(evicted_keys, d_masks, n);
+    //   gpu_boolean_mask<K, V, S, int64_t, TILE_SIZE>(
+    //       grid_size, block_size, d_masks, n, d_evicted_counter, d_offsets,
+    //       evicted_keys, evicted_values, evicted_scores, dim(), stream);
+      
+    //   return;
+    // }
+
+    
   }
 
   /**

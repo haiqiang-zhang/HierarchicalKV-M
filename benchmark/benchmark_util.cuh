@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <random>
 #include <unordered_set>
 #include "merlin/utils.cuh"
 

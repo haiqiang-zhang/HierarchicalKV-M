@@ -13,12 +13,78 @@ cp.cuda.Device(device_id).use()
 
 
 def pack_strings(str_list, width=10):
-    padded = [s.encode() if isinstance(s, str) else s for s in str_list]
-    padded = [s.ljust(width, b'\0')[:width] for s in padded]
-    return np.frombuffer(b''.join(padded), dtype=np.uint8).reshape(-1, width)
+    """
+    Pack a 2D array of strings into a uint8 numpy array
+    
+    Args:
+        str_list: 2D list of strings, shape (n_rows, n_cols)
+        width: maximum width for each string (will be padded/truncated to this size)
+    
+    Returns:
+        numpy array of shape (n_rows, n_cols * width) with dtype uint8
+    """
+    if not str_list:
+        return np.array([], dtype=np.uint8)
+    
+    # Handle both 1D and 2D cases
+    if isinstance(str_list[0], str):
+        # 1D case - convert to 2D with single row
+        str_list = [str_list]
+    
+    n_rows = len(str_list)
+    n_cols = len(str_list[0]) if str_list else 0
+    
+    # Create output array
+    result = np.zeros((n_rows, n_cols * width), dtype=np.uint8)
+    
+    for i, row in enumerate(str_list):
+        for j, s in enumerate(row):
+            # Convert string to bytes if needed
+            if isinstance(s, str):
+                s_bytes = s.encode('utf-8')
+            else:
+                s_bytes = s
+            
+            # Pad or truncate to width
+            s_padded = s_bytes.ljust(width, b'\0')[:width]
+            
+            # Copy to result array
+            start_idx = j * width
+            end_idx = start_idx + width
+            result[i, start_idx:end_idx] = np.frombuffer(s_padded, dtype=np.uint8)
+    
+    return result
 
-def unpack_strings(uint8_arr):
-    return [bytes(row).rstrip(b'\0').decode() for row in uint8_arr]
+def unpack_strings(uint8_arr, width=10):
+    """
+    Unpack a uint8 numpy array back to 2D list of strings
+    
+    Args:
+        uint8_arr: numpy array of shape (n_rows, n_cols * width) with dtype uint8
+        width: width of each packed string
+    
+    Returns:
+        2D list of strings
+    """
+    if uint8_arr.size == 0:
+        return []
+    
+    n_rows, total_width = uint8_arr.shape
+    n_cols = total_width // width
+    
+    result = []
+    for i in range(n_rows):
+        row = []
+        for j in range(n_cols):
+            start_idx = j * width
+            end_idx = start_idx + width
+            string_bytes = uint8_arr[i, start_idx:end_idx].tobytes()
+            # Remove null padding and decode
+            string_val = string_bytes.rstrip(b'\0').decode('utf-8')
+            row.append(string_val)
+        result.append(row)
+    
+    return result
 
 
 
@@ -111,7 +177,7 @@ def test_with_stringtype():
     
     # Create and initialize hash table
     options = mh.HashTableOptions()
-    options.dim = 1  # Each key corresponds to one string
+    options.dim = 5  # Each key corresponds to one string
     options.init_capacity = 1024 * 1024  # 1M
     options.max_capacity = 1024 * 1024   # 1M
     options.max_hbm_for_vectors = 4 * 1024 * 1024 * 1024  # 4GB
@@ -125,7 +191,11 @@ def test_with_stringtype():
     
     
     n = 3
-    strs = ['hellohello', 'cuda', 'world']
+    strs = [
+        ['hellohello', 'cudacuda', 'worldworld', 'hellohello', 'cudacuda'],
+        ['hellohello', 'cudacuda', 'worldworld', 'hellohello', 'cudacuda'],  
+        ['hellohello', 'cudacuda', 'worldworld', 'hellohello', 'cudacuda']
+    ]
     np_arr = pack_strings(strs)
     
     d_values = cp.asarray(np_arr)
@@ -146,7 +216,7 @@ def test_with_stringtype():
     table.find(n, d_keys.data.ptr, d_values_out.data.ptr, d_found.data.ptr, stream=stream.ptr)
     stream.synchronize()
     
-    print(unpack_strings(d_values_out))
+    print(unpack_strings(d_values_out, width=10))
     
     
     

@@ -15,6 +15,8 @@
 #include <thread>
 #include <numeric>
 #include <string>
+#include <functional>
+#include <map>
 
 #include "benchmark_util.cuh"    
 #include "merlin_hashtable.cuh"  
@@ -23,8 +25,7 @@
 using namespace nv::merlin;
 using benchmark::Timer;
 
-// Define the fixed string length
-const size_t MAX_STRING_LENGTH = 10; // Adjust this size as needed
+
 
 // Custom string type that is compatible with CUDA and Merlin library
 struct CustomString {
@@ -94,7 +95,8 @@ static void usage(const char* prog, const bool is_error = false) {
                          + "  --dim=N                vector dimension (default 5)\n"
                          + "  --initcapacity=N       table capacity (default 12M)\n"
                          + "  --hbm_gb=N             HBM budget in GB (default 18)\n"
-                         + "  --seed=N               RNG seed (default 42)\n";
+                         + "  --seed=N               RNG seed (default 42)\n"
+                         + "  --num_streams=N        Number of CUDA streams (default 1)\n";
   if (is_error) {
     std::cerr << "Error: " << prog << " [options]\n"
               << usage_msg << std::endl;
@@ -119,6 +121,7 @@ Flags parse_flags(int argc, char** argv) {
       {"initcapacity",    required_argument, nullptr, 'c'  },
       {"hbm_gb",          required_argument, nullptr, 'b'  },
       {"seed",            required_argument, nullptr, 'e'  },
+      {"num_streams",     required_argument, nullptr, 'N'  },
       {0,0,0,0}
   };
   int opt;
@@ -138,6 +141,7 @@ Flags parse_flags(int argc, char** argv) {
       case 'c': f.init_capacity   = std::strtoull(optarg, nullptr, 10);   break;
       case 'b': f.hbm_gb          = std::strtoul (optarg, nullptr, 10);   break;
       case 'e': f.seed            = std::strtoull(optarg, nullptr, 10);   break;
+      case 'N': f.num_streams     = std::strtoul (optarg, nullptr, 10);   break;
       default : usage(argv[0], true); exit(EXIT_FAILURE);
     }
   }
@@ -257,7 +261,7 @@ void generate_keys_parallel(uint32_t                 bs,
                             unsigned                 T = std::thread::hardware_concurrency())
 {
     // print the number of threads
-    std::cout << "T: " << T << std::endl;
+    // std::cout << "T: " << T << std::endl;
     std::vector<std::vector<K>> local_keys(T);   
 
     const uint32_t chunk = (bs + T - 1) / T;     
@@ -295,9 +299,14 @@ void generate_keys_parallel(uint32_t                 bs,
 
 
 BenchmarkResult run_ycsb(const Flags& cfg) {
-  cudaDeviceProp props;
-  CUDA_CHECK(cudaGetDeviceProperties(&props, cfg.gpu_id));
-  std::cout << "GPU: " << props.pciDeviceID << std::endl;
+  // Set the GPU device first
+  CUDA_CHECK(cudaSetDevice(cfg.gpu_id));
+
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  std::cout << "Available CUDA devices: " << device_count << std::endl;
+
+  std::cout << "GPU: " << cfg.gpu_id << std::endl;
   // ----- Create key generator -----
   std::unique_ptr<KeyGenerator> keygen;
   if (cfg.distribution == "uniform") {
@@ -316,6 +325,7 @@ BenchmarkResult run_ycsb(const Flags& cfg) {
   options.dim           = cfg.dim;
   options.max_hbm_for_vectors = nv::merlin::GB(cfg.hbm_gb);
   options.io_by_cpu     = false;
+  options.device_id     = cfg.gpu_id;  // Set the device ID in options
 
   std::unique_ptr<HKVTable> table = std::make_unique<HKVTable>();
   table->init(options);
@@ -323,15 +333,31 @@ BenchmarkResult run_ycsb(const Flags& cfg) {
   // ----- Allocate host buffers -----
   std::vector<K> h_keys(cfg.multiset_batch_size); // Use multiset_batch_size for write operations
   std::vector<CustomString> h_vals(cfg.multiset_batch_size * cfg.dim);
-  std::mt19937 rng(cfg.seed);  // Use the same seed for reproducibility
+  std::mt19937 rng(cfg.seed); 
   
+  // Host storage for preloaded data for verification
+  std::map<K, std::vector<CustomString>> preloaded_data_host;
+
   // Characters for random string generation
   const std::string charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   std::uniform_int_distribution<size_t> char_dist(0, charset.size() - 1);
   
   // ----- Device buffers -----
-  DeviceBuffers dbuf(cfg.multiset_batch_size, cfg.dim); // Use multiset_batch_size for write operations
-  cudaStream_t stream; CUDA_CHECK(cudaStreamCreate(&stream));
+  // Ensure dbuf is large enough for both read and write batches in the workload phase
+  uint32_t max_op_batch_size = std::max(cfg.multiget_batch_size, cfg.multiset_batch_size);
+
+  std::vector<DeviceBuffers> stream_specific_dbufs;
+  for (uint32_t i = 0; i < cfg.num_streams; ++i) {
+    stream_specific_dbufs.emplace_back(max_op_batch_size, cfg.dim);
+  }
+  std::cout << "Created " << cfg.num_streams << " stream-specific device buffers." << std::endl;
+
+  // Create a vector of CUDA streams
+  std::vector<cudaStream_t> streams(cfg.num_streams);
+  for (uint32_t i = 0; i < cfg.num_streams; ++i) {
+    CUDA_CHECK(cudaStreamCreate(&streams[i]));
+  }
+  cudaStream_t default_stream_for_preload = streams[0]; 
 
   // ------------------------------------------------------
   // Preload phase (multiset / insert_or_assign)
@@ -340,32 +366,40 @@ BenchmarkResult run_ycsb(const Flags& cfg) {
   uint64_t inserted = 0;
   while (inserted < cfg.record_count) {
     uint32_t this_batch = std::min<uint64_t>(cfg.multiset_batch_size, cfg.record_count - inserted);
-    // Generate sequential keys
+    // Generate keys
     for(uint32_t i=0; i<this_batch; ++i) h_keys[i] = inserted + i;
     
-    // Generate random string values
+    // Generate values
     for(uint32_t i=0; i<this_batch*cfg.dim; ++i) {
       CustomString& str = h_vals[i];
-      // Clear the string buffer
       memset(str.data, 0, MAX_STRING_LENGTH);
       
-      // Generate a random string
       for (uint32_t j = 0; j < MAX_STRING_LENGTH-1; ++j) {
         str[j] = charset[char_dist(rng)];
       }
-      // Ensure null termination
+
       str[MAX_STRING_LENGTH-1] = '\0';
     }
     
-    CUDA_CHECK(cudaMemcpyAsync(dbuf.d_keys, h_keys.data(), this_batch*sizeof(K), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(dbuf.d_values, h_vals.data(), this_batch*cfg.dim*sizeof(V), cudaMemcpyHostToDevice, stream));
-    table->insert_or_assign(this_batch, dbuf.d_keys, dbuf.d_values, nullptr, stream);  // Pass nullptr for scores
+    for (uint32_t k_idx = 0; k_idx < this_batch; ++k_idx) {
+        K current_key = h_keys[k_idx];
+        std::vector<CustomString> vals_for_key(cfg.dim);
+        for (uint32_t d = 0; d < cfg.dim; ++d) {
+            vals_for_key[d] = h_vals[k_idx * cfg.dim + d];
+        }
+        preloaded_data_host[current_key] = vals_for_key;
+    }
+
+    CUDA_CHECK(cudaMemcpy(stream_specific_dbufs[0].d_keys, h_keys.data(), this_batch*sizeof(K), cudaMemcpyHostToDevice)); 
+    CUDA_CHECK(cudaMemcpy(stream_specific_dbufs[0].d_values, h_vals.data(), this_batch*cfg.dim*sizeof(V), cudaMemcpyHostToDevice));
+    table->insert_or_assign(this_batch, stream_specific_dbufs[0].d_keys, stream_specific_dbufs[0].d_values, nullptr, default_stream_for_preload);
     inserted += this_batch;
-    if (inserted % (1ull * 1024) == 0) {
+    if (inserted % (1024ull * 1024ull) == 0) {
       std::cout << "Preloaded " << inserted << " records..." << std::endl;
     }
   }
-  CUDA_CHECK(cudaStreamSynchronize(stream));
+
+  CUDA_CHECK(cudaStreamSynchronize(default_stream_for_preload));
 
   // ------------------------------------------------------
   // Workload phase
@@ -382,56 +416,104 @@ BenchmarkResult run_ycsb(const Flags& cfg) {
   std::fill(batch_types.begin() + num_read_batches, batch_types.end(), false);
   
   // Shuffle the batch types
-  std::mt19937_64 rng_batch(cfg.seed);
+  std::mt19937_64 rng_batch(cfg.seed + 1); 
   std::shuffle(batch_types.begin(), batch_types.end(), rng_batch);
 
-  for (uint64_t batch = 0; batch < cfg.num_batch_ops; batch++) {
-    bool is_read_batch = batch_types[batch];
-    uint32_t batch_size = is_read_batch ? cfg.multiget_batch_size : cfg.multiset_batch_size;
+  // --- Pre-generate all keys, values, and workload operations ---
+  std::cout << "Pre-generating all keys, values, and operations for " << cfg.num_batch_ops << " batches..." << std::endl;
+  std::vector<std::vector<K>> all_batch_keys(cfg.num_batch_ops);
+  std::vector<std::vector<CustomString>> all_batch_values(cfg.num_batch_ops); 
+  std::vector<std::function<void()>> workload_batch_fns;
+  workload_batch_fns.reserve(cfg.num_batch_ops);
+
+  // GPU storage for all read results
+  std::vector<V*> d_all_results_values_out_list; 
+  std::vector<bool*> d_all_results_found_list;    
+  std::vector<uint32_t> read_op_batch_indices;    
+  std::vector<uint32_t> read_op_actual_sizes;   
+
+  uint32_t current_stream_idx = 0; // Initialize stream index for round-robin assignment
+
+  for (uint64_t batch_idx = 0; batch_idx < cfg.num_batch_ops; ++batch_idx) {
+    bool is_read_op = batch_types[batch_idx];
+    uint32_t current_batch_size = is_read_op ? cfg.multiget_batch_size : cfg.multiset_batch_size;
+    total_ops += current_batch_size; // Calculate total_ops here, outside the timed section
     
-    // Generate keys for this batch
-    std::vector<K> keys; keys.reserve(batch_size);
-    generate_keys_parallel(batch_size, *keygen, keys);
 
-    std::cout << "Batch " << batch << ": " << (is_read_batch ? "READ" : "WRITE") 
-              << " batch with " << keys.size() << " keys" << std::endl;
+    generate_keys_parallel(current_batch_size, *keygen, all_batch_keys[batch_idx]);
 
-    if (is_read_batch) {
-      // --- Read batch ---
-      timer.start();
-      CUDA_CHECK(cudaMemcpyAsync(dbuf.d_keys, keys.data(), keys.size()*sizeof(K), cudaMemcpyHostToDevice, stream));
-      table->find(keys.size(), dbuf.d_keys, dbuf.d_values_out, dbuf.d_found, nullptr, stream);
-      CUDA_CHECK(cudaStreamSynchronize(stream));
-      timer.end();
-      total_time += timer.getResult();
-      total_ops += keys.size();
-    } else {
-      // --- Write batch ---
-      // Generate random string values for write operations
-      std::vector<CustomString> vals(batch_size * cfg.dim);
-      for(uint32_t i=0; i<batch_size*cfg.dim; ++i) {
-        CustomString& str = vals[i];
-        memset(str.data, 0, MAX_STRING_LENGTH);
-        for (uint32_t j = 0; j < MAX_STRING_LENGTH-1; ++j) {
-          str[j] = charset[char_dist(rng)];
+    if (!is_read_op) { // It's a write batch, generate values
+        all_batch_values[batch_idx].resize(current_batch_size * cfg.dim);
+        for (uint32_t i = 0; i < current_batch_size * cfg.dim; ++i) {
+            CustomString& str = all_batch_values[batch_idx][i];
+            for (uint32_t j = 0; j < MAX_STRING_LENGTH - 1; ++j) {
+                str[j] = charset[char_dist(rng)];
+            }
+            str[MAX_STRING_LENGTH - 1] = '\0';
         }
-        str[MAX_STRING_LENGTH-1] = '\0';
-      }
-
-      timer.start();
-      CUDA_CHECK(cudaMemcpyAsync(dbuf.d_keys, keys.data(), keys.size()*sizeof(K), cudaMemcpyHostToDevice, stream));
-      CUDA_CHECK(cudaMemcpyAsync(dbuf.d_values, vals.data(), keys.size()*cfg.dim*sizeof(V), cudaMemcpyHostToDevice, stream));
-      table->insert_or_assign(keys.size(), dbuf.d_keys, dbuf.d_values, nullptr, stream);
-      CUDA_CHECK(cudaStreamSynchronize(stream));
-      timer.end();
-      total_time += timer.getResult();
-      total_ops += keys.size();
     }
 
-    std::cout << "Completed batch " << batch << ", total ops so far: " << total_ops << std::endl;
-  }
-  CUDA_CHECK(cudaStreamSynchronize(stream));
+    // Create and store the lambda for the current batch operation
+    cudaStream_t captured_stream = streams[current_stream_idx];
+    DeviceBuffers& captured_dbuf = stream_specific_dbufs[current_stream_idx];
 
+    if (is_read_op) {
+        // Allocate GPU memory for this specific read batch's results
+        V* d_current_batch_values_out;
+        bool* d_current_batch_found;
+        CUDA_CHECK(cudaMalloc(&d_current_batch_values_out, current_batch_size * cfg.dim * sizeof(V)));
+        CUDA_CHECK(cudaMalloc(&d_current_batch_found, current_batch_size * sizeof(bool)));
+        
+        d_all_results_values_out_list.push_back(d_current_batch_values_out);
+        d_all_results_found_list.push_back(d_current_batch_found);
+        read_op_batch_indices.push_back(batch_idx);
+        read_op_actual_sizes.push_back(current_batch_size);
+
+        workload_batch_fns.emplace_back(
+            [&keys = all_batch_keys[batch_idx], 
+             table_ptr = table.get(),
+             stream = captured_stream,
+             &dbuf_ref = captured_dbuf, // Stream-specific working buffer
+             d_target_values_out = d_current_batch_values_out, // Destination for this batch's values
+             d_target_found = d_current_batch_found]           // Destination for this batch's found flags
+            () { 
+                CUDA_CHECK(cudaMemcpyAsync(dbuf_ref.d_keys, keys.data(), keys.size()*sizeof(K), cudaMemcpyHostToDevice, stream));
+                table_ptr->find(keys.size(), dbuf_ref.d_keys, d_target_values_out, d_target_found, nullptr, stream);
+            }
+        );
+    } else { // Write op
+        workload_batch_fns.emplace_back(
+            [&keys = all_batch_keys[batch_idx], 
+             &vals = all_batch_values[batch_idx], 
+             dim_val = cfg.dim, 
+             table_ptr = table.get(),
+             stream = captured_stream,
+             &dbuf_ref = captured_dbuf] // Stream-specific working buffer
+            () { 
+                CUDA_CHECK(cudaMemcpyAsync(dbuf_ref.d_keys, keys.data(), keys.size()*sizeof(K), cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(dbuf_ref.d_values, vals.data(), keys.size()*dim_val*sizeof(V), cudaMemcpyHostToDevice, stream));
+                table_ptr->insert_or_assign(keys.size(), dbuf_ref.d_keys, dbuf_ref.d_values, nullptr, stream);
+            }
+        );
+    }
+    current_stream_idx = (current_stream_idx + 1) % cfg.num_streams;
+  }
+  std::cout << "Pre-generation complete." << std::endl;
+  
+  // --- Start Timer for Workload ---
+  timer.start();
+  
+
+  for (uint64_t batch_op_idx = 0; batch_op_idx < cfg.num_batch_ops; ++batch_op_idx) {
+    workload_batch_fns[batch_op_idx]();
+  }
+  
+  // --- Synchronize and Stop Timer ---
+  for (uint32_t i = 0; i < cfg.num_streams; ++i) {
+    CUDA_CHECK(cudaStreamSynchronize(streams[i]));
+  }
+  timer.end();
+  total_time = timer.getResult();
   double secs = total_time;
   double ops_per_sec = total_ops / secs;
   double gbkv_per_sec = total_ops / secs / 1e9;
@@ -439,6 +521,106 @@ BenchmarkResult run_ycsb(const Flags& cfg) {
   std::cout << "total_ops,time_ms,ops_per_sec,GB-kv/s\n";
   std::cout << total_ops << "," << secs*1000.0 << "," << ops_per_sec << "," << gbkv_per_sec << std::endl;
 
-  cudaStreamDestroy(stream);
+  // --- Verification Phase ---
+  // std::cout << "Copying results from GPU to Host for verification..." << std::endl;
+  // std::vector<std::vector<CustomString>> host_all_read_values_out(d_all_results_values_out_list.size());
+  // std::vector<std::vector<unsigned char>> host_all_read_found_uchar(d_all_results_found_list.size());
+
+  // for (size_t i = 0; i < d_all_results_values_out_list.size(); ++i) {
+  //     uint32_t num_keys_in_batch = read_op_actual_sizes[i];
+
+  //     host_all_read_values_out[i].resize(num_keys_in_batch * cfg.dim);
+  //     host_all_read_found_uchar[i].resize(num_keys_in_batch);
+
+  //     CUDA_CHECK(cudaMemcpy(host_all_read_values_out[i].data(),
+  //                           d_all_results_values_out_list[i],
+  //                           num_keys_in_batch * cfg.dim * sizeof(V),
+  //                           cudaMemcpyDeviceToHost));
+  //     CUDA_CHECK(cudaMemcpy(host_all_read_found_uchar[i].data(),
+  //                           d_all_results_found_list[i],
+  //                           num_keys_in_batch * sizeof(bool),
+  //                           cudaMemcpyDeviceToHost));
+  // }
+  // std::cout << "Copying complete. Starting verification..." << std::endl;
+  
+  // uint64_t correct_reads_found = 0;
+  // uint64_t correct_reads_not_found = 0;
+  // uint64_t incorrect_reads_value_mismatch = 0;
+  // uint64_t incorrect_reads_should_be_found = 0;
+  // uint64_t incorrect_reads_should_not_be_found = 0;
+  // uint64_t total_read_keys_verified = 0;
+
+  // for (size_t i = 0; i < host_all_read_values_out.size(); ++i) { // Loop through read batches
+  //     uint32_t original_batch_idx = read_op_batch_indices[i];
+  //     const std::vector<K>& current_read_op_keys = all_batch_keys[original_batch_idx];
+  //     const std::vector<CustomString>& actual_values_out_flat = host_all_read_values_out[i];
+  //     const std::vector<unsigned char>& actual_found_flags_uchar = host_all_read_found_uchar[i];
+
+  //     for (size_t k_idx = 0; k_idx < current_read_op_keys.size(); ++k_idx) { // Loop through keys in batch
+  //         total_read_keys_verified++;
+  //         K key_queried = current_read_op_keys[k_idx];
+  //         bool found_in_table = (actual_found_flags_uchar[k_idx] != 0);
+
+  //         auto it_preloaded = preloaded_data_host.find(key_queried);
+  //         bool was_preloaded = (it_preloaded != preloaded_data_host.end());
+
+  //         if (found_in_table) {
+  //             if (was_preloaded) {
+  //                 bool match = true;
+  //                 const std::vector<CustomString>& expected_vals_for_key = it_preloaded->second;
+  //                 for (uint32_t d = 0; d < cfg.dim; ++d) {
+  //                     if (memcmp(actual_values_out_flat[k_idx * cfg.dim + d].data, expected_vals_for_key[d].data, MAX_STRING_LENGTH) != 0) {
+  //                         match = false;
+  //                         break;
+  //                     }
+  //                 }
+  //                 if (match) {
+  //                     correct_reads_found++;
+  //                 } else {
+  //                     incorrect_reads_value_mismatch++;
+  //                     // Optional: Print mismatch details
+  //                     // std::cerr << "Mismatch for key " << key_queried << std::endl;
+  //                 }
+  //             } else {
+  //                 incorrect_reads_should_not_be_found++;
+  //                 // std::cerr << "Key " << key_queried << " found but was not preloaded." << std::endl;
+  //             }
+  //         } else { // Not found in table
+  //             if (was_preloaded) {
+  //                 incorrect_reads_should_be_found++;
+  //                 // std::cerr << "Key " << key_queried << " was preloaded but not found." << std::endl;
+  //             } else {
+  //                 correct_reads_not_found++;
+  //             }
+  //         }
+  //     }
+  // }
+  // std::cout << "Verification Complete:" << std::endl;
+  // std::cout << "  Total read keys verified: " << total_read_keys_verified << std::endl;
+  // std::cout << "  Correct reads found: " << correct_reads_found << std::endl;
+  // std::cout << "  Correct reads not found: " << correct_reads_not_found << std::endl;
+  // std::cout << "  Incorrect - Value Mismatch: " << incorrect_reads_value_mismatch << std::endl;
+  // std::cout << "  Incorrect - Should Have Been Found (but wasn't): " << incorrect_reads_should_be_found << std::endl;
+  // std::cout << "  Incorrect - Should Not Have Been Found (but was): " << incorrect_reads_should_not_be_found << std::endl;
+
+
+  // // Clean up GPU memory for results
+  // for (V* ptr : d_all_results_values_out_list) {
+  //     if (ptr) CUDA_CHECK(cudaFree(static_cast<void*>(ptr)));
+  // }
+  // for (bool* ptr : d_all_results_found_list) {
+  //     if (ptr) CUDA_CHECK(cudaFree(static_cast<void*>(ptr)));
+  // }
+  // d_all_results_values_out_list.clear();
+  // d_all_results_found_list.clear();
+
+  stream_specific_dbufs.clear();
+ 
+  for (uint32_t i = 0; i < cfg.num_streams; ++i) {
+
+    CUDA_CHECK(cudaStreamDestroy(streams[i]));
+  }
+
+
   return {secs, ops_per_sec, gbkv_per_sec};
 }

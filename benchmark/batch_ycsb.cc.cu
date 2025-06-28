@@ -30,18 +30,20 @@ struct BatchBenchmarkParams {
   std::vector<uint32_t> batch_sizes = {1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152};
   std::vector<double> read_props    = {1.0};
   std::string output_file           = "batch_benchmark_results.json";
-  uint16_t gpu_id                   = 0;
+  uint16_t gpu_id                   = 3;
   uint64_t record_count             = 6ull * 1024 * 1024;    // preload rows
   uint64_t num_batch_ops            = 200;                    // total batched ops
   double   read_prop                = 1;                     // read fraction
   std::string distribution          = "zipf";
-  double   theta                    = 0;                     // zipf skew
+  double   theta                    = 0.99;                     // zipf skew
   uint32_t multiget_batch_size      = 64 * 1024;             // keys per kernel launch
   uint32_t multiset_batch_size      = 64 * 1024;             // keys per kernel launch
   uint32_t dim                      = 5;                     // vector dimension
   uint64_t init_capacity            = 12ull * 1024 * 1024;   // slots
   uint32_t hbm_gb                   = 18;                    // HBM for vectors
   uint64_t seed                     = 42;
+  uint32_t repeat                   = 3;                     // Number of times to repeat each benchmark
+  uint32_t num_streams              = 4;                     // Number of CUDA streams
 };
 
 static void usage(const char* prog, const bool is_error = false) {
@@ -59,7 +61,9 @@ static void usage(const char* prog, const bool is_error = false) {
                         + "  --seed=N               RNG seed (default 42)\n"
                         + "  --batch_sizes=L        comma-separated list of batch sizes (e.g. 1024,2048,4096)\n"
                         + "  --read_props=L         comma-separated list of read proportions (e.g. 0.0,0.5,1.0)\n"
-                        + "  --output=s             output CSV file (default batch_benchmark_results.json)\n";
+                        + "  --output=s             output CSV file (default batch_benchmark_results.json)\n"
+                        + "  --repeat=N             number of times to repeat each benchmark (default 1)\n"
+                        + "  --num_streams=N        Number of CUDA streams (default 1)\n";
   if (is_error) {
     std::cerr << "Error: " << prog << " [options]\n"
               << usage_msg << std::endl;
@@ -102,6 +106,8 @@ Flags parse_batch_flags(int argc, char** argv, BatchBenchmarkParams& batch_param
       {"batch_sizes",     required_argument, nullptr, 'b'  },
       {"read_props",      required_argument, nullptr, 'p'  },
       {"output",          required_argument, nullptr, 'f'  },
+      {"repeat",          required_argument, nullptr, 'e'  },
+      {"num_streams",     required_argument, nullptr, 'N'  },
       {0,0,0,0}
   };
   
@@ -122,6 +128,8 @@ Flags parse_batch_flags(int argc, char** argv, BatchBenchmarkParams& batch_param
       case 'b': batch_params.batch_sizes = parse_comma_separated<uint32_t>(optarg); break;
       case 'p': batch_params.read_props = parse_comma_separated<double>(optarg);    break;
       case 'f': batch_params.output_file = optarg;                        break;
+      case 'e': batch_params.repeat          = std::strtoul(optarg, nullptr, 10); break;
+      case 'N': batch_params.num_streams     = std::strtoul (optarg, nullptr, 10);   break;
       default : usage(argv[0], true); exit(EXIT_FAILURE);
     }
   }
@@ -138,7 +146,7 @@ Flags parse_batch_flags(int argc, char** argv, BatchBenchmarkParams& batch_param
   f.init_capacity = batch_params.init_capacity;
   f.hbm_gb = batch_params.hbm_gb;
   f.seed = batch_params.seed;
-  
+  f.num_streams = batch_params.num_streams;
   return f;
 }
 
@@ -156,45 +164,50 @@ void run_batch_benchmark(const Flags& base_cfg, const BatchBenchmarkParams& batc
   // Run all combinations of batch sizes and read proportions
   for (const auto& batch_size : batch_params.batch_sizes) {
     for (const auto& read_prop : batch_params.read_props) {
-      Flags cfg = base_cfg;
-      cfg.multiget_batch_size = batch_size;
-      cfg.multiset_batch_size = batch_size;
-      cfg.read_prop = read_prop;
-      
-      std::cout << "Running benchmark with batch_size=" << batch_size 
-                << ", read_prop=" << read_prop << std::endl;
-      
-      BenchmarkResult result = run_ycsb(cfg);
-      std::array<int, 1> gpu_ids = {cfg.gpu_id};
-      json benchmark_result = {
-        {"workload", "YCSB_Batch"},
-        {"binding", "hierarchical_kv"},
-        {"distribution", cfg.distribution},
-        {"num_records", cfg.record_count},
-        {"batch_size", batch_size},
-        {"num_batch_ops", cfg.num_batch_ops},
-        {"multiget_prob", read_prop},
-        {"multiget_batch_size", cfg.multiget_batch_size},
-        {"multiset_batch_size", cfg.multiset_batch_size},
-        {"total_time", result.time_seconds},
-        {"throughput", result.ops_per_sec},
-        {"gbkv_per_sec", result.gbkv_per_sec},
-        {"gpu_device", gpu_ids},
-        {"min_field_length", 5},
-        {"max_field_length", 5},
-        {"field_count", cfg.dim},
-        {"init_capacity", cfg.init_capacity},
-        {"hbm_gb", cfg.hbm_gb},
-        {"load_factor", cfg.record_count / (double) cfg.init_capacity},
-        {"seed", cfg.seed}
-      };
-      
-      if (cfg.distribution == "zipf") {
-        benchmark_result["zipfian_theta"] = cfg.theta;
+      for (uint32_t rep = 0; rep < batch_params.repeat; ++rep) {
+        Flags cfg = base_cfg;
+        cfg.multiget_batch_size = batch_size;
+        cfg.multiset_batch_size = batch_size;
+        cfg.read_prop = read_prop;
+        
+        std::cout << "Running benchmark with batch_size=" << batch_size 
+                  << ", read_prop=" << read_prop 
+                  << ", repetition=" << rep + 1 << std::endl;
+        
+        BenchmarkResult result = run_ycsb(cfg);
+        std::array<int, 1> gpu_ids = {cfg.gpu_id};
+        json benchmark_result = {
+          {"workload", "YCSB_Batch"},
+          {"binding", "hierarchical_kv"},
+          {"distribution", cfg.distribution},
+          {"num_records", cfg.record_count},
+          {"batch_size", batch_size},
+          {"num_batch_ops", cfg.num_batch_ops},
+          {"multiget_prob", read_prop},
+          {"multiget_batch_size", cfg.multiget_batch_size},
+          {"multiset_batch_size", cfg.multiset_batch_size},
+          {"total_time", result.time_seconds},
+          {"throughput", result.ops_per_sec},
+          {"gbkv_per_sec", result.gbkv_per_sec},
+          {"gpu_device", gpu_ids},
+          {"min_field_length", MAX_STRING_LENGTH},
+          {"max_field_length", MAX_STRING_LENGTH},
+          {"field_count", cfg.dim},
+          {"init_capacity", cfg.init_capacity},
+          {"hbm_gb", cfg.hbm_gb},
+          {"load_factor", cfg.record_count / (double) cfg.init_capacity},
+          {"seed", cfg.seed},
+          {"num_streams", cfg.num_streams},
+          {"repetition", rep + 1}
+        };
+        
+        if (cfg.distribution == "zipf") {
+          benchmark_result["zipfian_theta"] = cfg.theta;
+        }
+        
+        results.push_back(benchmark_result);
+        std::cout << "  Completed: " << result.ops_per_sec << " ops/sec" << std::endl;
       }
-      
-      results.push_back(benchmark_result);
-      std::cout << "  Completed: " << result.ops_per_sec << " ops/sec" << std::endl;
     }
   }
   
@@ -221,6 +234,8 @@ int main(int argc, char** argv) {
   std::cout << "  Load factor: " << base_cfg.record_count / (double) base_cfg.init_capacity << std::endl;
   std::cout << "  HBM size (GB): " << base_cfg.hbm_gb << std::endl;
   std::cout << "  Seed: " << base_cfg.seed << std::endl;
+  std::cout << "  Repeat count: " << batch_params.repeat << std::endl;
+  std::cout << "  Number of streams: " << base_cfg.num_streams << std::endl;
   
   std::cout << "  Batch sizes to test: ";
   for (size_t i = 0; i < batch_params.batch_sizes.size(); i++) {
