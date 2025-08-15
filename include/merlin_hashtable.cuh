@@ -1650,10 +1650,12 @@ class HashTable : public HashTableBase<K, V, S> {
       return;
     }
 
+
     while (!reach_max_capacity_ &&
            fast_load_factor(n, stream) > options_.max_load_factor) {
       reserve(capacity() * 2, stream);
     }
+
 
     if (!ignore_evict_strategy) {
       check_evict_strategy(scores);
@@ -1825,10 +1827,12 @@ class HashTable : public HashTableBase<K, V, S> {
       return;
     }
 
+
     while (!reach_max_capacity_ &&
            fast_load_factor(n, stream) > options_.max_load_factor) {
       reserve(capacity() * 2, stream);
     }
+
 
     if (!ignore_evict_strategy) {
       check_evict_strategy(scores);
@@ -3519,6 +3523,15 @@ class HashTable : public HashTableBase<K, V, S> {
     size_t N = std::min(table_->buckets_num, 1024UL);
 
     thrust::device_ptr<int> size_ptr(table_->buckets_size);
+
+    // Create data on the host
+    std::vector<int> h_data = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+
+    // Transfer data to the device
+    thrust::device_vector<int> d_data = h_data;
+
+    // Perform reduction on the device
+    thrust::reduce(thrust_par(thrust_allocator_).on(stream), d_data.begin(), d_data.end(), 0, thrust::plus<int>());
 
     int size = thrust::reduce(thrust_par(thrust_allocator_).on(stream),
                               size_ptr, size_ptr + N, 0, thrust::plus<int>());
