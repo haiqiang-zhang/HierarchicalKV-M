@@ -3525,12 +3525,8 @@ class HashTable : public HashTableBase<K, V, S> {
     thrust::device_ptr<int> size_ptr(table_->buckets_size);
 
     // Create data on the host
-    std::vector<int> h_data = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-
-    // Transfer data to the device
+    std::vector<int> h_data = {0};
     thrust::device_vector<int> d_data = h_data;
-
-    // Perform reduction on the device
     thrust::reduce(thrust_par(thrust_allocator_).on(stream), d_data.begin(), d_data.end(), 0, thrust::plus<int>());
 
     int size = thrust::reduce(thrust_par(thrust_allocator_).on(stream),
